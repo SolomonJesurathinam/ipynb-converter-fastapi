@@ -1,8 +1,9 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import nbformat
-from nbconvert import HTMLExporter
+from nbconvert import HTMLExporter, SlidesExporter
 import logging
 
 # Configure logging
@@ -25,6 +26,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount the static files folder
+app.mount("/files", StaticFiles(directory="files"), name="files")
+
+
 @app.get("/", tags=["Health"])
 @app.get("/health", tags=["Health"])
 def health_check():
@@ -37,9 +42,12 @@ def health_check():
         "docs_url": "/docs"
     }
 
+VALID_TEMPLATES = {"lab", "classic", "basic", "reveal"}
+
 @app.post("/convert", response_class=HTMLResponse, tags=["Conversion"])
 def convert_notebook(
-    file: UploadFile = File(..., description="The .ipynb file to convert to HTML")
+    file: UploadFile = File(..., description="The .ipynb file to convert to HTML"),
+    template: str = Query("lab", description="The template to use: 'lab', 'classic', 'basic', or 'reveal'")
 ):
     """
     Convert an uploaded Jupyter Notebook (.ipynb) to a standalone HTML page completely in-memory.
@@ -53,7 +61,14 @@ def convert_notebook(
             detail="Invalid file extension. Only '.ipynb' files are supported."
         )
 
-    logger.info(f"Received notebook conversion request for file: {file.filename}")
+    if template not in VALID_TEMPLATES:
+        logger.warning(f"Conversion failed: Invalid template requested ({template})")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid template style. Must be one of: {', '.join(VALID_TEMPLATES)}"
+        )
+
+    logger.info(f"Received notebook conversion request for file: {file.filename} using template: {template}")
 
     # Read uploaded file bytes
     try:
@@ -62,6 +77,17 @@ def convert_notebook(
         
         # Parse the JSON string as a notebook node
         notebook = nbformat.reads(notebook_content, as_version=4)
+        
+        # If using reveal.js template, verify slideshow metadata exists; otherwise, inject it
+        if template == "reveal":
+            has_slide_type = any(
+                cell.metadata.get("slideshow", {}).get("slide_type")
+                for cell in notebook.cells
+            )
+            if not has_slide_type:
+                logger.info("No slide metadata found in notebook. Dynamically adding default slide structure...")
+                for cell in notebook.cells:
+                    cell.metadata["slideshow"] = {"slide_type": "slide"}
     except UnicodeDecodeError:
         logger.exception("Encoding error while reading notebook file.")
         raise HTTPException(
@@ -77,13 +103,16 @@ def convert_notebook(
 
     # 2. Conversion Pipeline (Runs in background thread pool to prevent event loop block)
     try:
-        logger.info("Executing in-memory HTML conversion...")
-        html_exporter = HTMLExporter()
-        html_exporter.template_name = 'classic'
+        logger.info(f"Executing in-memory HTML conversion with template '{template}'...")
+        if template == "reveal":
+            html_exporter = SlidesExporter(reveal_scroll=True)
+        else:
+            html_exporter = HTMLExporter(template_name=template)
         
         # Export completely in-memory without touching disk or launching a browser!
         html_data, _ = html_exporter.from_notebook_node(notebook)
         
+
         logger.info("HTML conversion complete!")
         return HTMLResponse(content=html_data)
     except Exception as e:
